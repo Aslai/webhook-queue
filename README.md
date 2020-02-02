@@ -12,12 +12,15 @@ This application depends on `bottle`, and expects a Python 3.8 environment or ne
 
 ## Configuration
 
-There are a few configuration options for this application. The only configuration that can be updated through the running application is user passwords. All other options require an application reload at this point.
+There are a few configuration options for this application. Users with `"can_reload": true` specified in their options can trigger a configuration reload. Additionally, updated passwords trigger an immediate flush of a new configuration file to disk.
 
 A sample configuration file would look like this (without the JS comments):
 
 ```js
 {
+    // Listen host and port for choosing where the server will listen to connections from
+    "listen_host": "0.0.0.0",
+    "listen_port": 8080,
     // The users array provides a set of all authorized users.
     "users": [
         {
@@ -28,6 +31,8 @@ A sample configuration file would look like this (without the JS comments):
             // that you change your password once the application is running to switch over to a SHA-512
             // hash.
             "pass_hash": "plain;;insecure",
+            // Whether this user can remotely trigger a reload via the reload endpoint
+            "can_reload": false,
             // A whitelist of queue names that this user can listen to.
             "queues": [
                 "foo"
@@ -169,6 +174,18 @@ Returns an empty body or `Error`
 Alters the current user's password and updates the configuration file.
 
 This endpoint is subject to user authentication.
+
+Returns an empty body or `Error`
+
+#### Reload configuration
+
+`POST /reload`
+
+Does an in-place reload of the configuration file. Existing queues will not have their contents discarded, however their configuration will be altered if the configuration file for that queue was changed. Queues and users that are no longer in the configuration file will be dropped. If the reload fails, the operation will be aborted.
+
+If a user is already listening to a queue when a reload occurs, the client will be put into a "disconnected" state if the queue is either removed or the user is no longer allowed to listen to that queue. You may unlisten to a disconnected client. Calling listen on a disconnected client will also succeed if it would have otherwise succeeded.
+
+This endpoint is subject to user authentication, and that user must have "can_reload": true in their user settings
 
 Returns an empty body or `Error`
 

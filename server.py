@@ -76,6 +76,12 @@ class StatusError(Exception):
         self.reason = reason
 
 
+class FatalError(StatusError):
+    def __init__(self, reason: str, other: Exception = None):
+        StatusError.__init__(self, 500, "FATAL ERROR: " + reason)
+        self.other = other
+
+
 class RefreshError(StatusError):
     def __init__(self, reason: str):
         StatusError.__init__(self, 410, reason)
@@ -95,6 +101,7 @@ class QueueMessage:
 class UserConf(TypedDict, total=True):
     name: str
     pass_hash: str
+    can_reload: bool
     queues: List[str]
 
 
@@ -116,6 +123,8 @@ class QueueConf(TypedDict, total=False):
 
 
 class Conf(TypedDict, total=False):
+    listen_host: str
+    listen_port: int
     users: List[UserConf]
     queues: List[QueueConf]
     max_message_count: int
@@ -124,9 +133,33 @@ class Conf(TypedDict, total=False):
 
 
 def load_conf(fname: str) -> Conf:
+    def validate(target: dict, name: str, required: List[str] = [], optional: List[str] = []):
+        keys = [key for key in target]
+        for req in required:
+            if req not in keys:
+                raise StatusError(500, "Required key '{}' was not found in '{}' object".format(req, name))
+        for key in keys:
+            if key not in required and key not in optional:
+                raise StatusError(500, "Unrecognized key '{}' was found in '{}' object".format(key, name))
+
     try:
         with open(fname, "r") as f:
-            return json.load(f)
+            default_conf = {"max_message_count": 100, "max_message_size": 20000, "max_queue_size": 1000000}
+            result = json.load(f)
+            validate(result, "base configuration", ["listen_host", "listen_port", "users", "queues"], ["max_message_count", "max_message_size", "max_queue_size"])
+            for u in result["users"]:
+                validate(u, "user", ["name", "pass_hash"], ["queues", "can_reload"])
+                if u["queues"] is None:
+                    u["queues"] = []
+            for q in result["queues"]:
+                validate(q, "queue", ["name"], ["whitelist_ip", "auth", "max_message_count", "max_message_size", "max_queue_size"])
+                if q["auth"] is not None:
+                    validate(q["auth"], "queue.auth", optional=["key", "method", "header_name"])
+                    # More Auth Methods
+                    # Insert more validators here as needed
+            default_conf.update(result)
+            return Conf(**default_conf)
+
     except FileNotFoundError:
         print("No configuration file found. Writing example configuration to", fname)
         with open(fname, "w") as f:
@@ -134,6 +167,8 @@ def load_conf(fname: str) -> Conf:
                 fp=f,
                 indent=4,
                 obj={
+                    "listen_host": "0.0.0.0",
+                    "listen_port": 8080,
                     "users": [{"name": "John Doe", "pass_hash": hash_pass("insecure", "plain"), "queues": ["foo"]}],
                     "queues": [{"name": "foo", "whitelist_ip": [], "auth": {"key": "12345", "method": "hmac-sha256", "header_name": "Foo-Auth"}}],
                     "max_message_count": 100,
@@ -155,6 +190,8 @@ class UserClient:
     def __init__(self, name: str, queue: str):
         self.name = name
         self.queue_name = queue
+        self.disconnected = False
+        self.disconnect_reason = ""
         global queues
         if queue not in queues:
             raise StatusError(404, "That queue does not exist")
@@ -167,13 +204,37 @@ class User:
         self.name = conf["name"]
         self.clients = {}
 
+    def load_from_conf(self, conf: UserConf):
+        global queues
+        self.conf = conf
+        for c in self.clients:
+            client: UserClient = self.clients[c]
+            if client.queue_name not in self.conf["queues"]:
+                client.disconnected = True
+                client.disconnect_reason = "A reload has caused that queue to no longer be available to you"
+            if client.queue_name not in queues:
+                client.disconnected = True
+                client.disconnect_reason = "A reload has removed that queue"
+
+    def get_client(self, client: str) -> UserClient:
+        if client not in self.clients:
+            raise StatusError(404, "You are not currently listening on that client")
+        c = self.clients[client]
+        if c.disconnected:
+            raise StatusError(410, "That client has been disconnected because: {}".format(c.disconnect_reason))
+        return c
+
     def listen(self, client: str, queue: str):
         if queue not in self.conf["queues"]:
             raise StatusError(404, "That queue is not available for listening")
         if client not in self.clients:
             self.clients[client] = UserClient(client, queue)
         else:
-            raise StatusError(400, "You are already listening from that client")
+            c = self.clients[client]
+            if c.disconnected:
+                self.clients[client] = UserClient(client, queue)
+            else:
+                raise StatusError(400, "You are already listening from that client")
 
     def unlisten(self, client: str):
         if client in self.clients:
@@ -188,15 +249,38 @@ class User:
         self.conf["pass_hash"] = hash_pass(new_password, salt=str(int(random.random() * 10000000000000)))
         write_conf(config_fname, config)
 
+    def can_reload(self):
+        return self.conf["can_reload"] == True
+
 
 class Queue:
     def __init__(self, globalConf: "Conf", conf: "QueueConf"):
+        self.name = conf["name"]
+        self.max_message_count = 0
+        self.max_message_size = 0
+        self.max_queue_size = 0
+        self.whitelist_ip = []
+
+        self.auth_key = None
+        self.auth_method = None
+        self.auth_header_name = None
+        # More Auth Methods
+        # Insert whatever new auth fields you need here
+
+        self.current_message: int = 0
+        self.messages: List[QueueMessage] = []
+        self.queue_size = 0
+
+        self.last_dropped_message = -1
+
+        self.load_from_conf(globalConf, conf)
+
+    def load_from_conf(self, globalConf: "Conf", conf: "QueueConf"):
         def load(conf, key: str, default_value=None):
             if conf is not None and key in conf:
                 return conf[key]
             return default_value
 
-        self.name = load(conf, "name")
         self.max_message_count = load(conf, "max_message_count", load(globalConf, "max_message_count"))
         self.max_message_size = load(conf, "max_message_size", load(globalConf, "max_message_size"))
         self.max_queue_size = load(conf, "max_queue_size", load(globalConf, "max_queue_size"))
@@ -207,13 +291,7 @@ class Queue:
         self.auth_method = load(auth, "method")
         self.auth_header_name = load(auth, "header_name")
         # More Auth Methods
-        # Insert whatever new auth fields you need here
-
-        self.current_message: int = 0
-        self.messages: List[QueueMessage] = []
-        self.queue_size = 0
-
-        self.last_dropped_message = -1
+        # Insert whatever new auth fields you need to load here
 
     # More Auth Methods
     # Alter this function to handle other ways to authenticate a webhook request
@@ -330,16 +408,46 @@ def must_authenticate() -> User:
 
 started_at = int(time.time())
 config_fname = "options.conf"
-config = load_conf(config_fname)
+config = Conf()
 queues = {}
 users = {}
 
-for q in config["queues"]:
-    new_queue = Queue(config, q)
-    queues[new_queue.name] = new_queue
-for u in config["users"]:
-    new_user = User(u)
-    users[new_user.name] = new_user
+
+def reload_conf():
+    global config, queues, users, config_fname
+    config = load_conf(config_fname)
+    old_queues = queues
+    old_users = users
+    queues = {}
+    users = {}
+    try:
+        for q in config["queues"]:
+            if q["name"] in old_queues:
+                new_queue = old_queues[q["name"]]
+                new_queue.load_from_conf(config, q)
+            else:
+                new_queue = Queue(config, q)
+            queues[new_queue.name] = new_queue
+        for u in config["users"]:
+            if u["name"] in old_users:
+                new_user = old_users[u["name"]]
+                new_user.load_from_conf(u)
+            else:
+                new_user = User(u)
+            users[new_user.name] = new_user
+    except Exception as e:
+        raise FatalError("Exception caught while importing new config", e)
+
+
+try:
+    reload_conf()
+except FatalError as e:
+    print("Failed to load configuration:", e.reason)
+    if e.other is not None:
+        raise e.other
+except StatusError as e:
+    print("Failed to load configuration:", e.reason)
+    exit(1)
 
 
 @post("/q/<name>")
@@ -365,11 +473,9 @@ def enqueue(name):
 def fetch(client):
     try:
         user = must_authenticate()
-        if client not in user.clients:
-            raise ValueError("You are not currently listening on that client")
-        c = user.clients[client]
+        c = user.get_client(client)
         if c.queue_name not in queues:
-            raise ValueError("Unknown queue '{}'".format(c.queue_name))
+            raise StatusError(404, "Unknown queue '{}'".format(c.queue_name))
         q = queues[c.queue_name]
         msgs = q.read(c)
         result = {"time": str(started_at), "messages": msgs, "current_message": q.current_message}
@@ -440,10 +546,35 @@ def set_password():
         return json.dumps({"refresh": False, "message": " ".join(e.args)})
 
 
+@get("/reload")
+def reload():
+    try:
+        user = must_authenticate()
+        if user.can_reload():
+            reload_conf()
+        else:
+            raise StatusError(403, "User does not have reload permissions")
+        return ""
+    except RefreshError as e:
+        response.status = e.status_code
+        return json.dumps({"refresh": True, "message": e.reason})
+    except FatalError as e:
+        response.status = e.status_code
+        if e.other is not None:
+            raise e.other
+        return json.dumps({"refresh": False, "message": e.reason + ". Please restart the server"})
+    except StatusError as e:
+        response.status = e.status_code
+        return json.dumps({"refresh": False, "message": e.reason})
+    except Exception as e:
+        response.status = 500
+        return json.dumps({"refresh": False, "message": " ".join(e.args)})
+
+
 @route("/time")
 def get_time():
     return "{}".format(started_at)
 
 
 if __name__ == "__main__":
-    run(host="localhost", port=8080)
+    run(host=config["listen_host"], port=config["listen_port"])
